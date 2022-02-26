@@ -2,6 +2,7 @@ name = "audiowave_rs"
 type = "javascript"
 workers_dev = true
 compatibility_date = "2022-02-18"
+usage_model = "unbound"
 
 [vars]
 WORKERS_RS_VERSION = "0.0.9"

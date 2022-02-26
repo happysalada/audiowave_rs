@@ -1,16 +1,22 @@
-use std::io::Cursor;
-use symphonia::core::{
-    codecs::{DecoderOptions, CODEC_TYPE_NULL},
-    formats::FormatOptions,
-    io::MediaSourceStream,
-    meta::MetadataOptions,
-    probe::Hint,
-};
+use lazy_static::lazy_static;
 use worker::{
     console_log, event, Cors, Date, Env, FormEntry, Method, Request, Response, Result, Router,
 };
 
+mod audio;
 mod utils;
+
+lazy_static! {
+    static ref CORS: Cors = Cors::default()
+        .with_max_age(86400)
+        .with_origins(vec!["*"])
+        .with_methods(vec![
+            Method::Get,
+            Method::Head,
+            Method::Post,
+            Method::Options,
+        ]);
+}
 
 fn log_request(req: &Request) {
     console_log!(
@@ -18,7 +24,7 @@ fn log_request(req: &Request) {
         Date::now().to_string(),
         req.path(),
         req.cf().coordinates().unwrap_or_default(),
-        req.cf().region().unwrap_or("unknown region".into())
+        req.cf().region().unwrap_or_else(|| "unknown region".into())
     );
 }
 
@@ -41,48 +47,17 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         .get("/", |_, _| Response::ok("Hello from Workers!"))
         .post_async("/audiowave", |mut req, _ctx| async move {
             match req.form_data().await?.get("file") {
-                Some(FormEntry::File(buf)) => {
-                    let cursor = Cursor::new(buf.bytes().await?);
-                    let media_source_stream =
-                        MediaSourceStream::new(Box::new(cursor), Default::default());
-
-                    // Create a probe hint using the file's extension. [Optional]
-                    let mut hint = Hint::new();
-                    hint.with_extension("mp3");
-
-                    // Use the default options for metadata and format readers.
-                    let meta_opts: MetadataOptions = Default::default();
-                    let fmt_opts: FormatOptions = Default::default();
-
-                    // Probe the media source.
-                    let probed = symphonia::default::get_probe()
-                        .format(&hint, media_source_stream, &fmt_opts, &meta_opts)
-                        .expect("unsupported format");
-
-                    // Get the instantiated format reader.
-                    let format = probed.format;
-
-                    // Find the first audio track with a known (decodeable) codec.
-                    let track = format
-                        .tracks()
-                        .iter()
-                        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-                        .expect("no supported audio tracks");
-
-                    // Use the default options for the decoder.
-                    let dec_opts: DecoderOptions = Default::default();
-
-                    // Create a decoder for the track.
-                    let mut decoder = symphonia::default::get_codecs()
-                        .make(&track.codec_params, &dec_opts)
-                        .expect("unsupported codec");
-
-                    // Store the track identifier, it will be used to filter packets.
-                    let track_id = track.id;
-                    dbg!(track_id);
-                    return Response::ok("processing");
+                Some(FormEntry::File(file)) => {
+                    let name = file.name();
+                    let bytes = file.bytes().await?;
+                    match audio::get_waveform(name, bytes) {
+                        Ok(waveform) => {
+                            Response::from_json(&waveform).and_then(|resp| resp.with_cors(&CORS))
+                        }
+                        Err(err) => Response::error(format!("Internal server error: {}", err), 500),
+                    }
                 }
-                Some(_) | None => return Response::error("Bad Request", 400),
+                Some(_) | None => Response::error("Bad Request", 400),
             }
         })
         // cors handling
@@ -93,16 +68,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 headers.get("Access-Control-Request-Method").transpose(),
                 headers.get("Access-Control-Request-Headers").transpose(),
             ) {
-                let cors = Cors::default()
-                    .with_max_age(86400)
-                    .with_origins(vec!["localhost:3000"])
-                    .with_methods(vec![
-                        Method::Get,
-                        Method::Head,
-                        Method::Post,
-                        Method::Options,
-                    ]);
-                Response::empty().and_then(|resp| resp.with_cors(&cors))
+                Response::empty().and_then(|resp| resp.with_cors(&CORS))
             } else {
                 Response::empty()
             }
