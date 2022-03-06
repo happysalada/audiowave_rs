@@ -2,6 +2,7 @@ use crate::utils::{div_up, get_extension_from_filename};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::io::Cursor;
+use strum_macros::EnumString;
 use symphonia::core::{
     audio::{AudioBufferRef, Signal},
     codecs::{DecoderOptions, CODEC_TYPE_NULL},
@@ -13,25 +14,46 @@ use symphonia::core::{
 };
 use worker::console_log;
 
-#[derive(Default, Debug, Clone, Serialize)]
-pub struct AmplitudeMinMax {
-    min: f32,
-    max: f32,
+#[derive(Debug, Clone, Serialize)]
+pub enum AmplitudeSummary {
+    MinMax { min: f32, max: f32 },
+    Average { total: f32, count: u64 },
 }
 
-impl AmplitudeMinMax {
+#[derive(Debug, EnumString)]
+pub enum WaveMode {
+    #[strum(ascii_case_insensitive)]
+    Average,
+    #[strum(ascii_case_insensitive)]
+    MinMax,
+}
+
+impl AmplitudeSummary {
     pub fn add(&mut self, sample: f32) {
-        if sample <= self.min {
-            self.min = sample;
-            return;
-        }
-        if sample >= self.max {
-            self.max = sample;
+        match self {
+            AmplitudeSummary::Average { total, count } => {
+                *total += sample;
+                *count += 1;
+            }
+            AmplitudeSummary::MinMax { min, max } => {
+                if sample <= *min {
+                    *min = sample;
+                    return;
+                }
+                if sample >= *max {
+                    *max = sample;
+                }
+            }
         }
     }
 }
 
-pub fn get_waveform(name: String, bytes: Vec<u8>) -> Result<Vec<AmplitudeMinMax>> {
+pub fn get_waveform(
+    name: String,
+    bytes: Vec<u8>,
+    mode: WaveMode,
+    points_per_sec: u64,
+) -> Result<Vec<AmplitudeSummary>> {
     // Create a probe hint using the file's extension. [Optional]
     let mut hint = Hint::new();
     if let Some(extension) = get_extension_from_filename(&name) {
@@ -70,10 +92,25 @@ pub fn get_waveform(name: String, bytes: Vec<u8>) -> Result<Vec<AmplitudeMinMax>
 
     // Store the track identifier, it will be used to filter packets.
     let track_id = track.id;
-    let sample_rate = track.codec_params.sample_rate.unwrap();
-    let n_frames = track.codec_params.n_frames.unwrap();
-    let n_seconds = div_up(n_frames, sample_rate);
-    let mut waveform: Vec<AmplitudeMinMax> = vec![AmplitudeMinMax::default(); n_seconds];
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .context("missing sample rate in metadata")?;
+    let n_frames = track
+        .codec_params
+        .n_frames
+        .context("missing number of frames in metadata")?;
+    let n_samples = div_up(n_frames * points_per_sec, sample_rate);
+    let mut waveform: Vec<AmplitudeSummary> = match mode {
+        WaveMode::MinMax => vec![AmplitudeSummary::MinMax { min: 0.0, max: 0.0 }; n_samples],
+        WaveMode::Average => vec![
+            AmplitudeSummary::Average {
+                total: 0.0,
+                count: 0
+            };
+            n_samples
+        ],
+    };
 
     // The decode loop.
     loop {
@@ -121,7 +158,9 @@ pub fn get_waveform(name: String, bytes: Vec<u8>) -> Result<Vec<AmplitudeMinMax>
                 match decoded {
                     F32(buf) => {
                         for (index, sample) in buf.chan(0).iter().enumerate() {
-                            let second = ((packet.ts + index as u64) / sample_rate as u64) as usize;
+                            let second = ((packet.ts + index as u64) * points_per_sec
+                                / sample_rate as u64)
+                                as usize;
                             let amplitude = waveform.get_mut(second).unwrap();
                             amplitude.add(*sample);
                         }

@@ -1,9 +1,11 @@
 use lazy_static::lazy_static;
+use std::str::FromStr;
 use worker::{
     console_log, event, Cors, Date, Env, FormEntry, Method, Request, Response, Result, Router,
 };
 
 mod audio;
+use audio::{get_waveform, WaveMode};
 mod utils;
 
 lazy_static! {
@@ -44,20 +46,37 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
     // functionality and a `RouteContext` which you can use to  and get route parameters and
     // Environment bindings like KV Stores, Durable Objects, Secrets, and Variables.
     router
-        .get("/", |_, _| Response::ok("Hello from Workers!"))
         .post_async("/audiowave", |mut req, _ctx| async move {
-            match req.form_data().await?.get("file") {
-                Some(FormEntry::File(file)) => {
+            let form = req.form_data().await?;
+            let file = form.get("file");
+            let mode = form.get("mode");
+            let points_per_sec = form.get("points");
+            match (file, mode, points_per_sec) {
+                (
+                    Some(FormEntry::File(file)),
+                    Some(FormEntry::Field(mode)),
+                    Some(FormEntry::Field(points_per_sec)),
+                ) => {
                     let name = file.name();
                     let bytes = file.bytes().await?;
-                    match audio::get_waveform(name, bytes) {
+                    let points_per_sec = match points_per_sec.parse::<u64>() {
+                        Ok(points_per_sec) => points_per_sec,
+                        _ => return Response::error("point arguments should be a number", 400),
+                    };
+                    let mode = match WaveMode::from_str(mode.as_ref()) {
+                        Ok(mode) => mode,
+                        _ => {
+                            return Response::error("mode should be either AVERAGE or MIN_MAX", 400)
+                        }
+                    };
+                    match get_waveform(name, bytes, mode, points_per_sec) {
                         Ok(waveform) => {
                             Response::from_json(&waveform).and_then(|resp| resp.with_cors(&CORS))
                         }
                         Err(err) => Response::error(format!("Internal server error: {}", err), 500),
                     }
                 }
-                Some(_) | None => Response::error("Bad Request", 400),
+                _ => Response::error("Bad Request", 400),
             }
         })
         // cors handling
